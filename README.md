@@ -14,6 +14,7 @@ UCVM is a specification for a distributed virtual machine system that operates t
 7. Load the programs if needed (after initialization)
 
 Check the date and time of the system and use the timesync program if needed.
+The rpg program is worth trying.
 
 ## System Architecture
 
