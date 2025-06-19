@@ -4,6 +4,15 @@
 
 UCVM is a specification for a distributed virtual machine system that operates through natural language interaction. The system implements a simplified computational model with distributed consensus, process management, and memory protection.
 
+## Quick Start with recommended settings
+
+1. Open Claude Web interface https://claude.ai/new
+2. Disable extended thinking
+3. Load the ucvm-cdm-spec.md document in the context
+4. Load the timesync and terminal programs repositories (or the entire programs repository)
+5. Write the initial prompt "start ucvm"
+6. Send to Claude
+
 ## System Architecture
 
 ### Core Components
