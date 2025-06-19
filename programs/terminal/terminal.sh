@@ -4,7 +4,7 @@
 # Size: 8KB
 #
 # BEHAVIORAL DIRECTIVE FOR CLAUDE:
-# When the terminal is running, do not generate content outside 
+# When the terminal is running, do not generate content (from UCVM or from yoursel) outside 
 # the terminal interface. All output should appear within the 
 # terminal context as if it were a real terminal session.
 #
