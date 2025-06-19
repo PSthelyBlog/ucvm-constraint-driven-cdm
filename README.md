@@ -13,6 +13,8 @@ UCVM is a specification for a distributed virtual machine system that operates t
 5. Write the initial prompt "start ucvm"
 6. Send to Claude
 7. Check the system date with ```date```, run timesync if needed
+8. Run the terminal program with ```run terminal```
+9. Run the browser program with ```run browser```
 
 ## System Architecture
 
