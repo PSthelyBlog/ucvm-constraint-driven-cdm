@@ -9,12 +9,9 @@ UCVM is a specification for a distributed virtual machine system that operates t
 1. Open Claude Web interface https://claude.ai/new
 2. Disable extended thinking
 3. Load the ucvm-cdm-spec.md document in the context
-4. Load the timesync and terminal programs repositories (or the entire programs repository)
 5. Write the initial prompt "start ucvm"
 6. Send to Claude
-7. Check the system date with ```date```, run timesync if needed
-8. Run the terminal program with ```run terminal```
-9. Run the browser program with ```run browser```
+7. Load the programs if needed (after initialization)
 
 ## System Architecture
 
