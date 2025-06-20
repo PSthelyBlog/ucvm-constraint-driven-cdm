@@ -1,4 +1,3 @@
-```
 #!/ucvm/bin/sh
 # UCVM Time Synchronization Service
 # Ring: KERNEL (requires privileged access to modify system time)
