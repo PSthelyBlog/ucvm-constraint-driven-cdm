@@ -1,6 +1,6 @@
 # Unified Claude-Mediated Virtual Machine (UCVM)
 
-**Update note**: the UCVM now uses the toolbridge.kmod module to bridge the system with Claude's tools (REPL, web_search, artifacts). Programs will be updated to use the module by default. The **timesync program won't execute without the toolbridge module**.
+**Update note**: the UCVM now uses the toolbridge.kmod module to bridge the system with Claude's tools (REPL, web_search, artifacts).
 
 ## Overview
 
