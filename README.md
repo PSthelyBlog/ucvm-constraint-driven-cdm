@@ -13,8 +13,8 @@ UCVM is a specification for a distributed virtual machine system that operates t
 3. Load the ucvm-cdm-spec.md document in the context
 5. Write the initial prompt "start ucvm"
 6. Send to Claude
-7. Load the toolbridge.kmod module
-8. Load the programs if needed (after initialization)
+7. Load the toolbridge.kmod module (after initialization)
+8. Load the programs if needed
 
 Check the date and time of the system and use the timesync program if needed.   
 The rpg program is worth trying (simulated multiplayer available)
