@@ -1,5 +1,7 @@
 # Unified Claude-Mediated Virtual Machine (UCVM)
 
+**Update note**: the UCVM now uses the toolbridge.kmod module to bridge the system with Claude's tools (REPL, web_search, artifacts). Programs will be updated to use the module by default. The **timesync program won't execute without the toolbridge module**.
+
 ## Overview
 
 UCVM is a specification for a distributed virtual machine system that operates through natural language interaction. The system implements a simplified computational model with distributed consensus, process management, and memory protection.
@@ -11,7 +13,8 @@ UCVM is a specification for a distributed virtual machine system that operates t
 3. Load the ucvm-cdm-spec.md document in the context
 5. Write the initial prompt "start ucvm"
 6. Send to Claude
-7. Load the programs if needed (after initialization)
+7. Load the toolbridge.kmod module
+8. Load the programs if needed (after initialization)
 
 Check the date and time of the system and use the timesync program if needed.   
 The rpg program is worth trying (simulated multiplayer available)
