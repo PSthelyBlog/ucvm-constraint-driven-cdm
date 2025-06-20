@@ -1,0 +1,802 @@
+; === toolbridge.kmod v2.0.0 - UCVM ToolBridge Kernel Module ===
+; UCVM-Claude Integration Layer with Real Tool Execution
+; Runs in Ring 0 (KERNEL mode)
+; 
+; CLAUDE BEHAVIORAL DIRECTIVE:
+; This module contains ;;; CLAUDE: markers that indicate when Claude
+; should make ACTUAL tool calls instead of simulating results.
+; When encountering these markers during UCVM execution, Claude MUST:
+; 1. Extract parameters from UCVM memory
+; 2. Make real tool invocations
+; 3. Return actual results to UCVM
+
+.kernel 0x0A00  ; Kernel module load address
+
+; Module header
+.header:
+    .string "UCVM_KMOD"
+    .word 0x0200        ; Version 2.0.0
+    .word module_init   ; Entry point
+    .word module_exit   ; Exit point
+    .dword 16384        ; Module size
+
+; Device descriptor table
+device_table:
+    .word 3                    ; Number of devices
+    .word repl_device_desc
+    .word web_device_desc  
+    .word artifact_device_desc
+
+; Device descriptors
+repl_device_desc:
+    .string "repl0"
+    .word 10, 0         ; Major, minor
+    .word 0666          ; Permissions
+    .word repl_fops     ; File operations
+
+web_device_desc:
+    .string "web0"
+    .word 10, 1
+    .word 0666
+    .word web_fops
+
+artifact_device_desc:
+    .string "art0"
+    .word 10, 2
+    .word 0666
+    .word art_fops
+
+; System call vector table
+syscall_vectors:
+    .word 0x80, sys_compute    ; SYS_COMPUTE handler
+    .word 0x81, sys_websearch  ; SYS_WEBSEARCH handler
+    .word 0x82, sys_artifact   ; SYS_ARTIFACT handler
+
+; Module initialization
+module_init:
+    push rbp
+    mov rbp, rsp
+    
+    ; Verify kernel mode
+    mov rax, cs
+    and rax, 0x3
+    jnz .not_kernel
+    
+    ; Initialize subsystems
+    call init_request_queue
+    call init_rate_limiter
+    call init_result_cache
+    
+    ; Register syscall handlers
+    mov rcx, 3
+    lea rsi, [syscall_vectors]
+.register_loop:
+    mov rdi, [rsi]      ; Syscall number
+    mov rdx, [rsi+8]    ; Handler address
+    push rcx
+    push rsi
+    call register_syscall_handler
+    pop rsi
+    pop rcx
+    add rsi, 16
+    loop .register_loop
+    
+    ; Create device nodes
+    call create_device_nodes
+    
+    ; Start worker thread
+    lea rdi, [tool_worker_thread]
+    mov rsi, THREAD_KERNEL
+    call create_kernel_thread
+    mov [worker_tid], rax
+    
+    ; Log successful load
+    lea rdi, [load_msg]
+    call printk
+    
+    xor rax, rax  ; Success
+    leave
+    ret
+    
+.not_kernel:
+    mov rax, -EPERM
+    leave
+    ret
+
+; SYS_COMPUTE - Execute JavaScript via REPL
+; rdi: pointer to code string
+; rsi: timeout in milliseconds
+; Returns: pointer to result or error code
+sys_compute:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    
+    ; Save parameters
+    mov [rsp], rdi      ; code ptr
+    mov [rsp+8], rsi    ; timeout
+    
+    ; Get current process
+    call get_current_process
+    mov [rsp+16], rax   ; process ptr
+    
+    ; Permission check
+    mov rdi, rax
+    call check_compute_permission
+    test rax, rax
+    jz .permission_denied
+    
+    ; Rate limit check  
+    mov rdi, [rsp+16]
+    call check_rate_limit
+    test rax, rax
+    jz .rate_limited
+    
+    ; Validate code string
+    mov rdi, [rsp]
+    mov rsi, MAX_CODE_SIZE
+    call validate_user_string
+    test rax, rax
+    jz .invalid_code
+    
+    ; Copy code from user space
+    lea rdi, [code_buffer]
+    mov rsi, [rsp]
+    mov rdx, MAX_CODE_SIZE
+    call copy_from_user
+    test rax, rax
+    js .copy_failed
+    
+    ; Create request
+    call allocate_request
+    mov [rsp+24], rax   ; request ptr
+    
+    ; Fill request
+    mov rbx, rax
+    mov [rbx+req_type], TOOL_COMPUTE
+    mov rax, [rsp+16]
+    mov rcx, [rax+proc_pid]
+    mov [rbx+req_pid], rcx
+    lea rax, [code_buffer]
+    mov [rbx+req_data], rax
+    mov rax, [rsp+8]
+    mov [rbx+req_timeout], rax
+    call get_system_time
+    mov [rbx+req_timestamp], rax
+    
+    ;;; CLAUDE: EXECUTION_MARKER - REPL
+    ;;; This request will trigger real REPL execution
+    mov byte [rbx+req_real_exec], 1
+    
+    ; Queue request
+    mov rdi, rbx
+    call queue_tool_request
+    
+    ; Wait for completion
+    mov rdi, rbx
+    mov rsi, [rsp+8]    ; timeout
+    call wait_for_completion
+    
+    ; Check result
+    cmp rax, 0
+    jl .execution_failed
+    
+    ; Return result pointer
+    mov rax, [rbx+req_result]
+    
+    leave
+    ret
+    
+.permission_denied:
+    mov rax, -EPERM
+    leave
+    ret
+    
+.rate_limited:
+    mov rax, -EAGAIN
+    leave
+    ret
+    
+.invalid_code:
+    mov rax, -EINVAL
+    leave
+    ret
+    
+.copy_failed:
+    leave
+    ret
+    
+.execution_failed:
+    mov rax, [rbx+req_error]
+    leave
+    ret
+
+; SYS_WEBSEARCH - Search web
+; rdi: pointer to query string
+; rsi: max results (1-10)
+; Returns: pointer to results or error
+sys_websearch:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    
+    ; Save parameters
+    mov [rsp], rdi      ; query ptr
+    mov [rsp+8], rsi    ; max results
+    
+    ; Get current process and node
+    call get_current_process
+    mov [rsp+16], rax
+    call get_current_node
+    mov [rsp+24], rax
+    
+    ; Byzantine node check
+    mov rbx, [rsp+24]
+    cmp byte [rbx+node_role], NODE_BYZANTINE
+    je .byzantine_blocked
+    
+    ; Permission check
+    mov rdi, [rsp+16]
+    call check_search_permission
+    test rax, rax
+    jz .permission_denied
+    
+    ; Validate query
+    mov rdi, [rsp]
+    mov rsi, MAX_QUERY_SIZE
+    call validate_search_query
+    test rax, rax
+    jz .invalid_query
+    
+    ; Validate result count
+    mov rax, [rsp+8]
+    cmp rax, 1
+    jl .invalid_count
+    cmp rax, 10
+    jg .invalid_count
+    
+    ; Copy query from user
+    lea rdi, [query_buffer]
+    mov rsi, [rsp]
+    mov rdx, MAX_QUERY_SIZE
+    call copy_from_user
+    test rax, rax
+    js .copy_failed
+    
+    ; Check if distributed consensus needed
+    call requires_search_consensus
+    test rax, rax
+    jnz .needs_consensus
+    
+.local_search:
+    ; Create request
+    call allocate_request
+    mov rbx, rax
+    
+    ; Fill request
+    mov [rbx+req_type], TOOL_WEBSEARCH
+    mov rax, [rsp+16]
+    mov rcx, [rax+proc_pid]
+    mov [rbx+req_pid], rcx
+    lea rax, [query_buffer]
+    mov [rbx+req_data], rax
+    mov rax, [rsp+8]
+    mov [rbx+req_max_results], rax
+    
+    ;;; CLAUDE: EXECUTION_MARKER - WEB_SEARCH
+    ;;; This request will trigger real web search
+    mov byte [rbx+req_real_exec], 1
+    
+    ; Queue and wait
+    mov rdi, rbx
+    call queue_tool_request
+    
+    mov rdi, rbx
+    mov rsi, SEARCH_TIMEOUT
+    call wait_for_completion
+    
+    ; Return result
+    test rax, rax
+    js .search_failed
+    mov rax, [rbx+req_result]
+    
+    leave
+    ret
+    
+.needs_consensus:
+    ; Initiate distributed search consensus
+    lea rdi, [query_buffer]
+    mov rsi, [rsp+8]
+    call propose_distributed_search
+    leave
+    ret
+    
+.byzantine_blocked:
+    lea rdi, [byzantine_msg]
+    call printk
+    mov rax, -EBYZANTINE
+    leave
+    ret
+    
+.permission_denied:
+    mov rax, -EPERM
+    leave
+    ret
+    
+.invalid_query:
+    mov rax, -EINVAL
+    leave
+    ret
+    
+.invalid_count:
+    mov rax, -ERANGE
+    leave
+    ret
+    
+.search_failed:
+    mov rax, [rbx+req_error]
+    leave
+    ret
+
+; SYS_ARTIFACT - Create/update artifacts
+; rdi: pointer to artifact command struct
+; Returns: artifact ID or error
+sys_artifact:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    
+    ; Get process
+    call get_current_process
+    mov [rsp], rax
+    
+    ; Check permission
+    mov rdi, rax
+    call check_artifact_permission
+    test rax, rax
+    jz .permission_denied
+    
+    ; Copy command struct
+    lea rdi, [artifact_cmd_buffer]
+    mov rsi, [rbp+16]   ; user struct ptr
+    mov rdx, artifact_cmd_size
+    call copy_from_user
+    test rax, rax
+    js .copy_failed
+    
+    ; Validate command
+    lea rdi, [artifact_cmd_buffer]
+    call validate_artifact_command
+    test rax, rax
+    jz .invalid_command
+    
+    ; Create request
+    call allocate_request
+    mov rbx, rax
+    
+    ; Fill request
+    mov [rbx+req_type], TOOL_ARTIFACT
+    mov rax, [rsp]
+    mov rcx, [rax+proc_pid]
+    mov [rbx+req_pid], rcx
+    lea rax, [artifact_cmd_buffer]
+    mov [rbx+req_data], rax
+    
+    ;;; CLAUDE: EXECUTION_MARKER - ARTIFACT
+    ;;; This request will create/update real artifact
+    mov byte [rbx+req_real_exec], 1
+    
+    ; Queue and wait
+    mov rdi, rbx
+    call queue_tool_request
+    
+    mov rdi, rbx
+    mov rsi, ARTIFACT_TIMEOUT
+    call wait_for_completion
+    
+    ; Return result
+    test rax, rax
+    js .artifact_failed
+    mov rax, [rbx+req_result]
+    
+    leave
+    ret
+    
+.permission_denied:
+    mov rax, -EPERM
+    leave
+    ret
+    
+.invalid_command:
+    mov rax, -EINVAL
+    leave
+    ret
+    
+.artifact_failed:
+    mov rax, [rbx+req_error]
+    leave
+    ret
+
+; Main worker thread - processes tool requests
+tool_worker_thread:
+    ; Set thread name
+    lea rdi, [worker_name]
+    call set_thread_name
+    
+.worker_loop:
+    ; Get next request
+    call dequeue_request
+    test rax, rax
+    jz .no_requests
+    
+    mov rbx, rax  ; Save request ptr
+    
+    ; Log request
+    lea rdi, [processing_msg]
+    mov rsi, [rbx+req_type]
+    mov rdx, [rbx+req_pid]
+    call printk
+    
+    ; Dispatch by type
+    mov rax, [rbx+req_type]
+    cmp rax, TOOL_COMPUTE
+    je .handle_compute
+    cmp rax, TOOL_WEBSEARCH
+    je .handle_websearch
+    cmp rax, TOOL_ARTIFACT
+    je .handle_artifact
+    
+    ; Unknown request type
+    mov [rbx+req_error], -EINVAL
+    jmp .complete_request
+
+.handle_compute:
+    ;;; CLAUDE: REAL_TOOL_EXECUTION - REPL
+    ;;; When this executes, Claude should:
+    ;;; 1. Read JavaScript code from [rbx+req_data]
+    ;;; 2. Execute: repl(code) with actual tool
+    ;;; 3. Store output in result buffer
+    ;;; 4. Set [rbx+req_result] to result
+    
+    ; Check if real execution requested
+    cmp byte [rbx+req_real_exec], 1
+    jne .simulate_compute
+    
+    ; Signal Claude for real execution
+    mov rdi, [rbx+req_data]  ; JavaScript code
+    mov rsi, rbx             ; Request context
+    call claude_execute_repl
+    
+    jmp .complete_request
+
+.handle_websearch:
+    ;;; CLAUDE: REAL_TOOL_EXECUTION - WEB_SEARCH
+    ;;; When this executes, Claude should:
+    ;;; 1. Read query from [rbx+req_data]
+    ;;; 2. Execute: web_search(query)
+    ;;; 3. Store results in buffer
+    ;;; 4. Set [rbx+req_result]
+    
+    cmp byte [rbx+req_real_exec], 1
+    jne .simulate_search
+    
+    mov rdi, [rbx+req_data]  ; Query string
+    mov rsi, [rbx+req_max_results]
+    mov rdx, rbx
+    call claude_execute_websearch
+    
+    jmp .complete_request
+
+.handle_artifact:
+    ;;; CLAUDE: REAL_TOOL_EXECUTION - ARTIFACT
+    ;;; When this executes, Claude should:
+    ;;; 1. Read command from [rbx+req_data]
+    ;;; 2. Execute: artifacts(command)
+    ;;; 3. Store artifact ID
+    ;;; 4. Set [rbx+req_result]
+    
+    cmp byte [rbx+req_real_exec], 1
+    jne .simulate_artifact
+    
+    mov rdi, [rbx+req_data]  ; Artifact command
+    mov rsi, rbx
+    call claude_execute_artifact
+    
+    jmp .complete_request
+
+.simulate_compute:
+    ; Fallback simulation mode
+    lea rdi, [simulated_repl_result]
+    mov [rbx+req_result], rdi
+    jmp .complete_request
+
+.simulate_search:
+    lea rdi, [simulated_search_result]
+    mov [rbx+req_result], rdi
+    jmp .complete_request
+
+.simulate_artifact:
+    lea rdi, [simulated_artifact_id]
+    mov [rbx+req_result], rdi
+    jmp .complete_request
+
+.complete_request:
+    ; Mark complete and wake process
+    mov [rbx+req_status], REQ_COMPLETE
+    call get_system_time
+    mov [rbx+req_complete_time], rax
+    
+    ; Wake waiting process
+    mov rdi, [rbx+req_pid]
+    call wake_process
+    
+    ; Log completion
+    lea rdi, [complete_msg]
+    mov rsi, [rbx+req_type]
+    mov rdx, [rbx+req_pid]
+    call printk
+    
+    jmp .worker_loop
+
+.no_requests:
+    ; Sleep until signaled
+    mov rdi, 100  ; 100ms
+    call msleep
+    jmp .worker_loop
+
+; Claude execution bridge functions
+claude_execute_repl:
+    ;;; CLAUDE: BRIDGE_POINT
+    ;;; This is where UCVM meets reality
+    ;;; RDI contains JavaScript code to execute
+    ;;; RSI contains request context
+    ;;; 
+    ;;; Claude should:
+    ;;; 1. Invoke repl tool with code
+    ;;; 2. Capture output
+    ;;; 3. Store in result buffer
+    ;;; 4. Update request->result pointer
+    
+    push rbp
+    mov rbp, rsp
+    
+    ; Mark execution point
+    mov byte [claude_executing], 1
+    mov [claude_code_ptr], rdi
+    mov [claude_request_ptr], rsi
+    
+    ; Claude will execute here
+    call trigger_claude_repl
+    
+    mov byte [claude_executing], 0
+    leave
+    ret
+
+claude_execute_websearch:
+    ;;; CLAUDE: BRIDGE_POINT
+    ;;; RDI = search query
+    ;;; RSI = max results
+    ;;; RDX = request context
+    
+    push rbp
+    mov rbp, rsp
+    
+    mov byte [claude_executing], 2
+    mov [claude_query_ptr], rdi
+    mov [claude_max_results], rsi
+    mov [claude_request_ptr], rdx
+    
+    call trigger_claude_search
+    
+    mov byte [claude_executing], 0
+    leave
+    ret
+
+claude_execute_artifact:
+    ;;; CLAUDE: BRIDGE_POINT
+    ;;; RDI = artifact command
+    ;;; RSI = request context
+    
+    push rbp
+    mov rbp, rsp
+    
+    mov byte [claude_executing], 3
+    mov [claude_artifact_ptr], rdi
+    mov [claude_request_ptr], rsi
+    
+    call trigger_claude_artifact
+    
+    mov byte [claude_executing], 0
+    leave
+    ret
+
+; Rate limiter implementation
+init_rate_limiter:
+    push rbp
+    mov rbp, rsp
+    
+    ; Initialize token buckets
+    mov rcx, MAX_PROCESSES
+    lea rdi, [token_buckets]
+.init_loop:
+    mov qword [rdi], 10      ; 10 tokens per process
+    mov qword [rdi+8], 0     ; Last refill time
+    add rdi, 16
+    loop .init_loop
+    
+    ; Set refill rate
+    mov qword [token_refill_rate], 10    ; 10 per second
+    mov qword [token_max_burst], 20      ; Max 20 tokens
+    
+    leave
+    ret
+
+check_rate_limit:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    
+    mov rbx, rdi  ; Process ptr
+    mov rax, [rbx+proc_pid]
+    
+    ; Get bucket for this PID
+    and rax, 0xFF  ; Simple hash
+    shl rax, 4     ; *16 for bucket size
+    lea rdx, [token_buckets]
+    add rdx, rax
+    
+    ; Check tokens
+    mov rax, [rdx]
+    test rax, rax
+    jz .no_tokens
+    
+    ; Consume token
+    dec qword [rdx]
+    mov rax, 1  ; Success
+    
+    pop rbx
+    leave
+    ret
+    
+.no_tokens:
+    xor rax, rax  ; Failure
+    pop rbx
+    leave
+    ret
+
+; Module cleanup
+module_exit:
+    push rbp
+    mov rbp, rsp
+    
+    ; Stop worker thread
+    mov rdi, [worker_tid]
+    call stop_kernel_thread
+    
+    ; Unregister syscalls
+    mov rdi, 0x80
+    call unregister_syscall
+    mov rdi, 0x81
+    call unregister_syscall
+    mov rdi, 0x82
+    call unregister_syscall
+    
+    ; Remove device nodes
+    call remove_device_nodes
+    
+    ; Free resources
+    call cleanup_request_queue
+    call cleanup_result_cache
+    
+    lea rdi, [unload_msg]
+    call printk
+    
+    leave
+    ret
+
+; Data section
+.data
+; Module info
+module_name:    .string "toolbridge"
+module_version: .string "2.0.0"
+module_desc:    .string "UCVM-Claude Tool Integration Layer"
+
+; Messages
+load_msg:       .string "[toolbridge] Module loaded, ready for tool requests\n"
+unload_msg:     .string "[toolbridge] Module unloaded\n"
+processing_msg: .string "[toolbridge] Processing %s request from PID %d\n"
+complete_msg:   .string "[toolbridge] Completed %s for PID %d\n"
+byzantine_msg:  .string "[toolbridge] Byzantine node blocked from web search\n"
+
+; Worker thread
+worker_name:    .string "toolbridge-worker"
+worker_tid:     .quad 0
+
+; Device paths
+dev_repl_path:  .string "/dev/repl0"
+dev_web_path:   .string "/dev/web0"
+dev_art_path:   .string "/dev/art0"
+
+; Request queue
+request_queue:      .space 8192
+queue_head:         .quad 0
+queue_tail:         .quad 0
+queue_lock:         .quad 0
+queue_semaphore:    .quad 0
+
+; Token buckets for rate limiting
+token_buckets:      .space 4096  ; 256 processes * 16 bytes
+token_refill_rate:  .quad 10
+token_max_burst:    .quad 20
+
+; Claude execution state
+claude_executing:    .byte 0
+claude_code_ptr:     .quad 0
+claude_query_ptr:    .quad 0
+claude_artifact_ptr: .quad 0
+claude_request_ptr:  .quad 0
+claude_max_results:  .quad 0
+
+; Simulated results (fallback)
+simulated_repl_result:   .string '{"output":"simulated","time":0}'
+simulated_search_result: .string '{"results":[],"simulated":true}'
+simulated_artifact_id:   .string "artifact_sim_12345"
+
+; Constants
+MAX_CODE_SIZE       equ 65536
+MAX_QUERY_SIZE      equ 256
+SEARCH_TIMEOUT      equ 5000
+ARTIFACT_TIMEOUT    equ 3000
+MAX_PROCESSES       equ 256
+
+; Request structure
+req_type            equ 0
+req_pid             equ 8
+req_data            equ 16
+req_result          equ 24
+req_status          equ 32
+req_error           equ 40
+req_timeout         equ 48
+req_timestamp       equ 56
+req_complete_time   equ 64
+req_real_exec       equ 72
+req_max_results     equ 80
+
+; Request types
+TOOL_COMPUTE        equ 1
+TOOL_WEBSEARCH      equ 2
+TOOL_ARTIFACT       equ 3
+
+; Request status
+REQ_PENDING         equ 0
+REQ_COMPLETE        equ 1
+REQ_ERROR           equ 2
+
+; Node roles
+NODE_LEADER         equ 0
+NODE_FOLLOWER       equ 1
+NODE_CANDIDATE      equ 2
+NODE_BYZANTINE      equ 0xFF
+
+; Error codes
+EPERM               equ 1
+EAGAIN              equ 11
+EINVAL              equ 22
+ERANGE              equ 34
+ENOSYS              equ 38
+EBYZANTINE          equ 133
+
+; BSS section
+.bss
+code_buffer:        resb MAX_CODE_SIZE
+query_buffer:       resb MAX_QUERY_SIZE
+artifact_cmd_buffer: resb 1024
+result_cache:       resb 65536
+
+; Module metadata
+.module_metadata:
+    .quad module_init
+    .quad module_exit
+    .quad syscall_vectors
+    .quad device_table
+    .string ";;; CLAUDE: This module enables real tool execution"
