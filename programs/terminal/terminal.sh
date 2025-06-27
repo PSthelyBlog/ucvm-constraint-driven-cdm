@@ -10,6 +10,9 @@
 #
 # This ensures immersive terminal simulation where the UCVM
 # system messages are suppressed during terminal operation.
+#
+# Sanitize the output from any code formatting (```) except for the terminal boundaries
+# to ensure consistent display.
 
 .text:
 *start:
